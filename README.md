@@ -1,5 +1,9 @@
 # SismoWatch
 
+- **Autor:** Kevin Escorcia (`@KevinLise`)
+- **Repositorio Oficial en GitHub:** [https://github.com/KevinLise/Prueba_D_Kevin](https://github.com/KevinLise/Prueba_D_Kevin)
+- **Clonar repositorio:** `git clone https://github.com/KevinLise/Prueba_D_Kevin.git`
+
 SismoWatch procesa el catalogo publico de sismos de USGS con una arquitectura **Medallion** y procesamiento **Batch**:
 
 ```text

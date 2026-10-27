@@ -14,11 +14,12 @@ Esta guía paso a paso permite instalar, configurar, levantar, verificar y depur
 
 ---
 
-## 2. Configuración del Archivo `.env`
+## 2. Clonación del Repositorio y Configuración del Archivo `.env`
 
-1. Ubíquese en la raíz del proyecto:
+1. Clone el repositorio oficial desde GitHub (o ubíquese en la carpeta del proyecto descomprimido):
    ```bash
-   cd /home/cohorte5/Documentos/Prueba_Kevin
+   git clone https://github.com/KevinLise/Prueba_D_Kevin.git
+   cd Prueba_D_Kevin
    ```
 2. Si no existe el archivo `.env`, cópielo desde la plantilla `.env.example`:
    ```bash
