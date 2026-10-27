@@ -1,0 +1,236 @@
+name: sismowatch
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow.Dockerfile
+  image: sismowatch-airflow:local
+  env_file:
+    - .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/airflow
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    PYTHONPATH: /opt/airflow
+    PYTHONDONTWRITEBYTECODE: "1"
+    SISMOWATCH_DB_HOST: ${SISMOWATCH_DB_HOST}
+    SISMOWATCH_DB_PORT: ${SISMOWATCH_DB_PORT}
+    SISMOWATCH_DB_NAME: ${SISMOWATCH_DB_NAME}
+    SISMOWATCH_DB_USER: ${SISMOWATCH_DB_USER}
+    SISMOWATCH_DB_PASSWORD: ${SISMOWATCH_DB_PASSWORD}
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./ingest:/opt/airflow/ingest:ro
+    - ./config:/opt/airflow/config:ro
+    - ./spark_jobs:/opt/airflow/spark_jobs:ro
+    - ./db:/opt/airflow/db:ro
+    - ./pipeline:/opt/airflow/pipeline:ro
+    - ./agent:/opt/airflow/agent:ro
+    - airflow-logs:/opt/airflow/logs
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    sismowatch-db:
+      condition: service_healthy
+
+services:
+  # Metadatos internos de Airflow. No contiene datos sismicos.
+  airflow-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Base operativa: ejecuciones, calidad, usuarios y configuracion.
+  sismowatch-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SISMOWATCH_DB_USER}
+      POSTGRES_PASSWORD: ${SISMOWATCH_DB_PASSWORD}
+      POSTGRES_DB: ${SISMOWATCH_DB_NAME}
+    volumes:
+      - sismowatch-pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SISMOWATCH_DB_USER} -d ${SISMOWATCH_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "airflow db migrate &&
+      (airflow users create
+        --username ${AIRFLOW_ADMIN_USER}
+        --password ${AIRFLOW_ADMIN_PASSWORD}
+        --firstname Admin
+        --lastname SismoWatch
+        --role Admin
+        --email ${AIRFLOW_ADMIN_EMAIL} || true)"
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      sismowatch-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      sismowatch-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+
+  # Silo es un fork mantenido y compatible con MinIO. Las imagenes oficiales
+  # minio/minio y minio/mc dejaron de publicarse en Docker Hub.
+  minio:
+    image: pgsty/silo:latest
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    build:
+      context: .
+      dockerfile: docker/minio-init.Dockerfile
+    image: sismowatch-minio-init:local
+    env_file:
+      - .env
+    depends_on:
+      minio:
+        condition: service_started
+    restart: "no"
+
+  spark-master:
+    image: apache/spark:3.5.1
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "7077:7077"
+      - "8082:8080"
+    volumes:
+      - ./spark_jobs:/opt/spark-jobs:ro
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+      - --memory
+      - 2g
+      - --cores
+      - "2"
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark_jobs:/opt/spark-jobs:ro
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: sismowatch-api:local
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8001:8000"
+    depends_on:
+      sismowatch-db:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/streamlit.Dockerfile
+    image: sismowatch-dashboard:local
+    environment:
+      PYTHONPATH: /app
+      SISMOWATCH_API_URL: http://api:8000
+      API_KEY: ${API_KEY}
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  airflow-pgdata:
+  sismowatch-pgdata:
+  airflow-logs:
